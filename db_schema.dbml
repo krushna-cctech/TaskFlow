@@ -17,6 +17,7 @@ Table boards {
   id char(36) [pk, not null]
   owner_id char(36) [not null]
   name varchar(100) [not null]
+  board_status varchar(20) [not null, default: 'draft', note: 'Allowed values: active, archived, draft, deleted']
   created_at timestamp [not null, default: `CURRENT_TIMESTAMP`]
   updated_at timestamp [not null, default: `CURRENT_TIMESTAMP`]
 }

@@ -38,7 +38,7 @@ paths:
       tags: [Boards]
       operationId: listBoards
       summary: List boards available to the current user
-      description: Returns boards owned by the authenticated user and boards where they are an active member. The optional q parameter searches board names using a case-insensitive partial match.
+      description: Returns boards owned by the authenticated user and boards where they are an active member. Supports a case-insensitive partial name search and filtering by board status. The cursor must be passed back unchanged with the same filters.
       parameters:
         - name: q
           in: query
@@ -47,6 +47,7 @@ paths:
           schema:
             type: string
             maxLength: 100
+        - $ref: '#/components/parameters/BoardStatusFilter'
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
       responses:
@@ -770,6 +771,13 @@ components:
       schema:
         type: string
         format: uuid
+    BoardStatusFilter:
+      name: board_status
+      in: query
+      required: false
+      description: Filter boards by lifecycle status.
+      schema:
+        $ref: '#/components/schemas/BoardStatus'
     TodoNameQuery:
       name: q
       in: query
@@ -832,10 +840,15 @@ components:
       type: string
       format: uuid
 
+    BoardStatus:
+      type: string
+      description: Board lifecycle status.
+      enum: [active, archived, draft, deleted]
+
     Board:
       type: object
       additionalProperties: false
-      required: [id, name, owner_id, created_at, updated_at]
+      required: [id, name, owner_id, board_status, created_at, updated_at]
       properties:
         id:
           allOf:
@@ -849,6 +862,10 @@ components:
         owner_id:
           allOf:
             - $ref: '#/components/schemas/UUID'
+          readOnly: true
+        board_status:
+          allOf:
+            - $ref: '#/components/schemas/BoardStatus'
           readOnly: true
         created_at:
           type: string
