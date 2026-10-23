@@ -1,59 +1,399 @@
 openapi: 3.0.3
 info:
-  title: TaskFlow TODO API
-  version: 1.0.0
+  title: TaskFlow API
+  version: 2.0.0
   description: |
-    REST API for creating and managing TODO items.
+    Planned REST API for private and shared Kanban boards.
 
-    Contract decisions:
-    - TODO IDs are UUIDs.
-    - Valid statuses are `pending`, `in_progress`, and `completed`.
-    - A newly created TODO defaults to `pending` when status is omitted.
-    - List operations use opaque cursor-based pagination, not page numbers or OFFSET.
-    - The maximum page size is 100; the default is 20.
-    - Timestamps are returned as RFC 3339 date-time strings in UTC.
-    - This API specification does not define authentication because no authentication
-      requirement has been selected for the current project.
+    Users authenticate through an external OIDC-compatible identity provider.
+    The API accepts its bearer access tokens and does not provide registration,
+    password, or token-issuance endpoints.
+
+    Board and task data is visible only to the owner and active board members.
+    Deleting an active task moves it to trash. Permanent deletion is a separate
+    owner-only operation on trashed tasks. Activity is retained after permanent
+    task deletion.
 servers:
   - url: http://localhost:8080
     description: Local development server
+security:
+  - bearerAuth: []
 tags:
+  - name: Boards
+    description: Create and manage private or shared boards
+  - name: Members
+    description: Invite users and manage board membership
   - name: Todos
-    description: Create, retrieve, list, update, and delete TODO items
+    description: Manage active tasks on a board
+  - name: Trash
+    description: Review, restore, and permanently delete trashed tasks
+  - name: Activity
+    description: Review successful changes to a board
   - name: Health
     description: Application health and readiness checks
 
 paths:
-  /v1/todos:
+  /v1/boards:
+    get:
+      tags: [Boards]
+      operationId: listBoards
+      summary: List boards available to the current user
+      description: Returns boards owned by the authenticated user and boards where they are an active member. The optional q parameter searches board names using a case-insensitive partial match.
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: Case-insensitive partial match on board name.
+          schema:
+            type: string
+            maxLength: 100
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of boards
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BoardListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags: [Boards]
+      operationId: createBoard
+      summary: Create a private board
+      description: Creates a board owned by the authenticated user. The owner is its first member; sharing is optional.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBoardRequest'
+      responses:
+        '201':
+          description: Board created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Board'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/boards/{boardId}:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    get:
+      tags: [Boards]
+      operationId: getBoard
+      summary: Get a board
+      responses:
+        '200':
+          description: Board details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Board'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/BoardNotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    patch:
+      tags: [Boards]
+      operationId: updateBoard
+      summary: Rename a board
+      description: The owner or an active board member can rename the board.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateBoardRequest'
+      responses:
+        '200':
+          description: Board updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Board'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/BoardNotFound'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/boards/{boardId}/members:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    get:
+      tags: [Members]
+      operationId: listBoardMembers
+      summary: List board members
+      description: Optionally filter active members by a case-insensitive partial match on name or email, and by role.
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: Case-insensitive partial match on member name or email.
+          schema:
+            type: string
+            maxLength: 255
+        - name: role
+          in: query
+          required: false
+          description: Filter by board role.
+          schema:
+            type: string
+            enum: [owner, member]
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of active board members
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BoardMemberListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/BoardNotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/boards/{boardId}/invitations:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    get:
+      tags: [Members]
+      operationId: listBoardInvitations
+      summary: List pending board invitations
+      description: Only the board owner can view pending invitations. The optional q parameter searches invited email addresses using a case-insensitive partial match.
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: Case-insensitive partial match on the invited email address.
+          schema:
+            type: string
+            maxLength: 255
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of pending invitations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvitationListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/BoardNotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags: [Members]
+      operationId: inviteBoardMember
+      summary: Invite a user to a board
+      description: Only the board owner can invite a user. An invitee gains access after accepting while signed in to the matching verified email account.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInvitationRequest'
+      responses:
+        '201':
+          description: Invitation created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invitation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/BoardNotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/boards/{boardId}/invitations/{invitationId}:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+      - $ref: '#/components/parameters/InvitationId'
+    delete:
+      tags: [Members]
+      operationId: revokeBoardInvitation
+      summary: Revoke a pending invitation
+      description: Only the board owner can revoke an invitation.
+      responses:
+        '204':
+          description: Invitation revoked
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/InvitationNotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/invitations/{invitationId}/accept:
+    parameters:
+      - $ref: '#/components/parameters/InvitationId'
+    post:
+      tags: [Members]
+      operationId: acceptBoardInvitation
+      summary: Accept a board invitation
+      description: The authenticated account's verified email must match the invitation's email.
+      responses:
+        '200':
+          description: Invitation accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvitationAcceptanceResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/InvitationNotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/boards/{boardId}/members/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+      - $ref: '#/components/parameters/UserId'
+    delete:
+      tags: [Members]
+      operationId: removeBoardMember
+      summary: Remove a member from a board
+      description: Only the board owner can remove a member. The owner's membership cannot be removed through this operation. Removing a member also clears their task assignments from the board.
+      responses:
+        '204':
+          description: Member removed
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/BoardNotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/boards/{boardId}/todos:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    get:
+      tags: [Todos]
+      operationId: listTodos
+      summary: List active tasks
+      description: Returns active tasks in stable ascending order by (created_at, id). Supports case-insensitive partial name search, workflow status, assignee, and inclusive due-date filters. The cursor must be passed back unchanged with the same filters.
+      parameters:
+        - $ref: '#/components/parameters/TodoNameQuery'
+        - $ref: '#/components/parameters/TodoStatusFilter'
+        - $ref: '#/components/parameters/TodoAssigneeFilter'
+        - $ref: '#/components/parameters/TodoDueAfter'
+        - $ref: '#/components/parameters/TodoDueBefore'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of active tasks
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TodoListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/BoardNotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
     post:
       tags: [Todos]
       operationId: createTodo
-      summary: Create a TODO
-      description: Creates a TODO item. If `status` is omitted, it defaults to `pending`.
+      summary: Create a task
+      description: Creates an active task. If status is omitted, it defaults to pending.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/CreateTodoRequest'
-            example:
-              name: Learn Go interfaces
-              status: pending
       responses:
         '201':
-          description: TODO created
+          description: Task created
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Todo'
-              example:
-                id: 550e8400-e29b-41d4-a716-446655440000
-                name: Learn Go interfaces
-                status: pending
-                created_at: '2026-10-15T15:30:00Z'
-                updated_at: '2026-10-15T15:30:00Z'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/BoardNotFound'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
         '500':
@@ -61,127 +401,85 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
-    get:
-      tags: [Todos]
-      operationId: listTodos
-      summary: List TODOs
-      description: |
-        Returns a bounded page of TODOs in stable ascending order by
-        `(created_at, id)`. The cursor is opaque to clients and must be passed
-        back unchanged. The server may return fewer items than `limit`.
-        `next_cursor` is null when there are no more results.
-      parameters:
-        - name: limit
-          in: query
-          required: false
-          description: Number of items to return. Defaults to 20 and is capped at 100.
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 100
-            default: 20
-        - name: cursor
-          in: query
-          required: false
-          description: Opaque cursor returned by a previous list response.
-          schema:
-            type: string
-            minLength: 1
+  /v1/boards/{boardId}/todos/bulk/trash:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    post:
+      tags: [Trash]
+      operationId: bulkTrashTodos
+      summary: Move multiple tasks to trash
+      description: Processes each task independently and reports an outcome for every requested ID. At most 100 distinct IDs are accepted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BulkTodoRequest'
       responses:
         '200':
-          description: A page of TODOs
+          description: Per-task results
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TodoListResponse'
-              example:
-                items:
-                  - id: 550e8400-e29b-41d4-a716-446655440000
-                    name: Learn Go interfaces
-                    status: pending
-                    created_at: '2026-10-15T15:30:00Z'
-                    updated_at: '2026-10-15T15:30:00Z'
-                next_cursor: eyJjcmVhdGVkX2F0IjoiLi4uIiwiaWQiOiIuLi4ifQ
-                has_more: true
+                $ref: '#/components/schemas/BulkTodoResult'
         '400':
-          description: Invalid limit or cursor
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-              examples:
-                invalidLimit:
-                  value:
-                    error:
-                      code: invalid_limit
-                      message: Limit must be between 1 and 100
-                invalidCursor:
-                  value:
-                    error:
-                      code: invalid_cursor
-                      message: Cursor is invalid
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/BoardNotFound'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
         '500':
           $ref: '#/components/responses/InternalServerError'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
-  /v1/todos/{id}:
+  /v1/boards/{boardId}/todos/{todoId}:
     parameters:
+      - $ref: '#/components/parameters/BoardId'
       - $ref: '#/components/parameters/TodoId'
     get:
       tags: [Todos]
       operationId: getTodo
-      summary: Get a TODO by ID
+      summary: Get an active task
       responses:
         '200':
-          description: TODO found
+          description: Task details
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Todo'
-        '400':
-          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/TodoNotFound'
         '500':
           $ref: '#/components/responses/InternalServerError'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
-
     patch:
       tags: [Todos]
       operationId: updateTodo
-      summary: Update a TODO
-      description: |
-        Updates one or more fields. Omitted fields remain unchanged.
-        At least one updatable field must be provided. Explicit null values
-        are not supported.
+      summary: Update a task
+      description: Updates one or more fields. Omitted fields remain unchanged. Explicit null clears description, due_date, or assignee_ids.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/UpdateTodoRequest'
-            examples:
-              updateStatus:
-                value:
-                  status: completed
-              updateName:
-                value:
-                  name: Finish Go API documentation
-              updateBoth:
-                value:
-                  name: Finish and review Go API documentation
-                  status: in_progress
       responses:
         '200':
-          description: TODO updated
+          description: Task updated
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Todo'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/TodoNotFound'
         '415':
@@ -190,18 +488,209 @@ paths:
           $ref: '#/components/responses/InternalServerError'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
-
     delete:
       tags: [Todos]
-      operationId: deleteTodo
-      summary: Delete a TODO
+      operationId: trashTodo
+      summary: Move a task to trash
+      description: This operation is reversible. It does not permanently delete the task.
       responses:
         '204':
-          description: TODO deleted successfully; response body is empty
-        '400':
-          $ref: '#/components/responses/BadRequest'
+          description: Task moved to trash
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/TodoNotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/boards/{boardId}/trash:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    get:
+      tags: [Trash]
+      operationId: listTrashedTodos
+      summary: List trashed tasks
+      description: Supports the same name, status, assignee, and due-date filters as the active task list, plus inclusive deleted_at timestamp bounds. The cursor must be passed back unchanged with the same filters.
+      parameters:
+        - $ref: '#/components/parameters/TodoNameQuery'
+        - $ref: '#/components/parameters/TodoStatusFilter'
+        - $ref: '#/components/parameters/TodoAssigneeFilter'
+        - $ref: '#/components/parameters/TodoDueAfter'
+        - $ref: '#/components/parameters/TodoDueBefore'
+        - name: deleted_after
+          in: query
+          required: false
+          description: Include tasks moved to trash at or after this timestamp.
+          schema:
+            type: string
+            format: date-time
+        - name: deleted_before
+          in: query
+          required: false
+          description: Include tasks moved to trash at or before this timestamp.
+          schema:
+            type: string
+            format: date-time
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of trashed tasks
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TodoListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/BoardNotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/boards/{boardId}/trash/bulk/delete:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    post:
+      tags: [Trash]
+      operationId: bulkPermanentlyDeleteTodos
+      summary: Permanently delete multiple trashed tasks
+      description: Owner-only and irreversible. Processes each task independently and reports an outcome for every requested ID. At most 100 distinct IDs are accepted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BulkTodoRequest'
+      responses:
+        '200':
+          description: Per-task results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BulkTodoResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/BoardNotFound'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/boards/{boardId}/trash/{todoId}/restore:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+      - $ref: '#/components/parameters/TodoId'
+    post:
+      tags: [Trash]
+      operationId: restoreTodo
+      summary: Restore a task from trash
+      description: Restores the task to its saved workflow status.
+      responses:
+        '200':
+          description: Task restored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Todo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/TodoNotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/boards/{boardId}/trash/{todoId}:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+      - $ref: '#/components/parameters/TodoId'
+    delete:
+      tags: [Trash]
+      operationId: permanentlyDeleteTodo
+      summary: Permanently delete a trashed task
+      description: Owner-only and irreversible. The task is removed but its activity history is retained.
+      responses:
+        '204':
+          description: Task permanently deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/TodoNotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/boards/{boardId}/activity:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    get:
+      tags: [Activity]
+      operationId: listBoardActivity
+      summary: List board activity
+      description: Returns successful task and membership changes in reverse chronological order. Activity is retained when a task is permanently deleted. Results can be filtered by action, actor, and inclusive occurrence-time bounds. The cursor must be passed back unchanged with the same filters.
+      parameters:
+        - name: action
+          in: query
+          required: false
+          description: Filter by activity action.
+          schema:
+            $ref: '#/components/schemas/ActivityAction'
+        - name: actor_id
+          in: query
+          required: false
+          description: Filter by the UUID of the user who performed the action.
+          schema:
+            $ref: '#/components/schemas/UUID'
+        - name: occurred_after
+          in: query
+          required: false
+          description: Include events at or after this timestamp.
+          schema:
+            type: string
+            format: date-time
+        - name: occurred_before
+          in: query
+          required: false
+          description: Include events at or before this timestamp.
+          schema:
+            type: string
+            format: date-time
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of activity events
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivityListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/BoardNotFound'
         '500':
           $ref: '#/components/responses/InternalServerError'
         '503':
@@ -209,10 +698,10 @@ paths:
 
   /health:
     get:
+      security: []
       tags: [Health]
       operationId: healthCheck
       summary: Check application process health
-      description: Indicates whether the API process is running. This endpoint should not be used alone to decide whether the service can accept traffic.
       responses:
         '200':
           description: Application process is healthy
@@ -220,87 +709,347 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
-              example:
-                status: ok
 
   /ready:
     get:
+      security: []
       tags: [Health]
       operationId: readinessCheck
       summary: Check application readiness
-      description: Indicates whether the application is ready to serve requests, including required dependency checks such as MySQL.
       responses:
         '200':
-          description: Application is ready
+          description: Application is ready to serve requests
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ReadinessResponse'
-              example:
-                status: ready
         '503':
           description: Application is not ready
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ReadinessResponse'
-              example:
-                status: not_ready
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Access token issued by the configured external OIDC-compatible identity provider. Token validation is deployment-specific.
+
   parameters:
-    TodoId:
-      name: id
+    BoardId:
+      name: boardId
       in: path
       required: true
-      description: UUID of the TODO item.
+      description: UUID of the board.
       schema:
         type: string
         format: uuid
-      example: 550e8400-e29b-41d4-a716-446655440000
+    TodoId:
+      name: todoId
+      in: path
+      required: true
+      description: UUID of the task.
+      schema:
+        type: string
+        format: uuid
+    UserId:
+      name: userId
+      in: path
+      required: true
+      description: UUID of the board member.
+      schema:
+        type: string
+        format: uuid
+    InvitationId:
+      name: invitationId
+      in: path
+      required: true
+      description: UUID of the invitation.
+      schema:
+        type: string
+        format: uuid
+    TodoNameQuery:
+      name: q
+      in: query
+      required: false
+      description: Case-insensitive partial task-name search.
+      schema:
+        type: string
+        maxLength: 255
+    TodoStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Filter by workflow status.
+      schema:
+        $ref: '#/components/schemas/TodoStatus'
+    TodoAssigneeFilter:
+      name: assignee_id
+      in: query
+      required: false
+      description: Filter by the UUID of an assigned board member.
+      schema:
+        $ref: '#/components/schemas/UUID'
+    TodoDueAfter:
+      name: due_after
+      in: query
+      required: false
+      description: Include tasks due on or after this date.
+      schema:
+        type: string
+        format: date
+    TodoDueBefore:
+      name: due_before
+      in: query
+      required: false
+      description: Include tasks due on or before this date.
+      schema:
+        type: string
+        format: date
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Number of items to return. Defaults to 20; allowed range is 1 through 100.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor returned by a previous list response.
+      schema:
+        type: string
+        minLength: 1
 
   schemas:
-    TodoStatus:
+    UUID:
       type: string
-      description: Current lifecycle status of the TODO.
-      enum:
-        - pending
-        - in_progress
-        - completed
-      example: pending
+      format: uuid
 
-    Todo:
+    Board:
       type: object
       additionalProperties: false
-      required:
-        - id
-        - name
-        - status
-        - created_at
-        - updated_at
+      required: [id, name, owner_id, created_at, updated_at]
       properties:
         id:
-          type: string
-          format: uuid
+          allOf:
+            - $ref: '#/components/schemas/UUID'
           readOnly: true
-          description: Server-generated unique identifier.
         name:
           type: string
           minLength: 1
-          maxLength: 255
-          description: Human-readable task name.
-        status:
-          $ref: '#/components/schemas/TodoStatus'
+          maxLength: 100
+          description: Board name; whitespace-only names are invalid.
+        owner_id:
+          allOf:
+            - $ref: '#/components/schemas/UUID'
+          readOnly: true
         created_at:
           type: string
           format: date-time
           readOnly: true
-          description: Creation timestamp in UTC.
         updated_at:
           type: string
           format: date-time
           readOnly: true
-          description: Last update timestamp in UTC.
+
+    CreateBoardRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          pattern: '[\s\S]*\S[\s\S]*'
+          example: My tasks
+
+    UpdateBoardRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          pattern: '[\s\S]*\S[\s\S]*'
+
+    BoardListResponse:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Board'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+
+    BoardMember:
+      type: object
+      additionalProperties: false
+      required: [user_id, name, email, role, joined_at]
+      properties:
+        user_id:
+          $ref: '#/components/schemas/UUID'
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          enum: [owner, member]
+        joined_at:
+          type: string
+          format: date-time
+
+    BoardMemberListResponse:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/BoardMember'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+
+    InvitationStatus:
+      type: string
+      enum: [pending, accepted, revoked, expired]
+
+    Invitation:
+      type: object
+      additionalProperties: false
+      required: [id, board_id, email, status, invited_by, created_at, expires_at]
+      properties:
+        id:
+          allOf:
+            - $ref: '#/components/schemas/UUID'
+          readOnly: true
+        board_id:
+          $ref: '#/components/schemas/UUID'
+        email:
+          type: string
+          format: email
+        status:
+          $ref: '#/components/schemas/InvitationStatus'
+        invited_by:
+          $ref: '#/components/schemas/UUID'
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          description: Invitations expire seven days after creation unless accepted or revoked.
+
+    CreateInvitationRequest:
+      type: object
+      additionalProperties: false
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 255
+
+    InvitationListResponse:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Invitation'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+
+    InvitationAcceptanceResponse:
+      type: object
+      additionalProperties: false
+      required: [invitation, board]
+      properties:
+        invitation:
+          $ref: '#/components/schemas/Invitation'
+        board:
+          $ref: '#/components/schemas/Board'
+
+    TodoStatus:
+      type: string
+      description: Current workflow stage.
+      enum: [pending, in_progress, completed]
+
+    Todo:
+      type: object
+      additionalProperties: false
+      required: [id, board_id, name, status, description, due_date, assignee_ids, created_by, created_at, updated_at, deleted_at]
+      properties:
+        id:
+          allOf:
+            - $ref: '#/components/schemas/UUID'
+          readOnly: true
+        board_id:
+          $ref: '#/components/schemas/UUID'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          pattern: '[\s\S]*\S[\s\S]*'
+        status:
+          $ref: '#/components/schemas/TodoStatus'
+        description:
+          type: string
+          maxLength: 10000
+          nullable: true
+        due_date:
+          type: string
+          format: date
+          nullable: true
+        assignee_ids:
+          type: array
+          nullable: true
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/UUID'
+          description: Assigned users must be active members of this board.
+        created_by:
+          $ref: '#/components/schemas/UUID'
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+          readOnly: true
 
     CreateTodoRequest:
       type: object
@@ -311,11 +1060,25 @@ components:
           type: string
           minLength: 1
           maxLength: 255
-          description: Task name. Whitespace-only names are invalid.
-          example: Learn Go interfaces
+          pattern: '[\s\S]*\S[\s\S]*'
+          description: Required task name. Whitespace-only names are invalid.
         status:
-          $ref: '#/components/schemas/TodoStatus'
-          description: Initial status. Defaults to `pending` when omitted.
+          allOf:
+            - $ref: '#/components/schemas/TodoStatus'
+          description: Defaults to pending when omitted.
+        description:
+          type: string
+          maxLength: 10000
+          nullable: true
+        due_date:
+          type: string
+          format: date
+          nullable: true
+        assignee_ids:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/UUID'
 
     UpdateTodoRequest:
       type: object
@@ -326,9 +1089,23 @@ components:
           type: string
           minLength: 1
           maxLength: 255
-          description: New task name. Whitespace-only names are invalid.
+          pattern: '[\s\S]*\S[\s\S]*'
         status:
           $ref: '#/components/schemas/TodoStatus'
+        description:
+          type: string
+          maxLength: 10000
+          nullable: true
+        due_date:
+          type: string
+          format: date
+          nullable: true
+        assignee_ids:
+          type: array
+          nullable: true
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/UUID'
 
     TodoListResponse:
       type: object
@@ -342,10 +1119,111 @@ components:
         next_cursor:
           type: string
           nullable: true
-          description: Opaque cursor for the next page, or null when there are no more results.
         has_more:
           type: boolean
-          description: True when another page is available.
+
+    BulkTodoRequest:
+      type: object
+      additionalProperties: false
+      required: [todo_ids]
+      properties:
+        todo_ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/UUID'
+
+    BulkTodoItemResult:
+      type: object
+      additionalProperties: false
+      required: [todo_id, success]
+      properties:
+        todo_id:
+          $ref: '#/components/schemas/UUID'
+        success:
+          type: boolean
+        error:
+          type: object
+          nullable: true
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+
+    BulkTodoResult:
+      type: object
+      additionalProperties: false
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/BulkTodoItemResult'
+
+    ActivityAction:
+      type: string
+      enum:
+        - board.created
+        - board.renamed
+        - task.created
+        - task.updated
+        - task.status_changed
+        - task.trashed
+        - task.restored
+        - task.permanently_deleted
+        - member.invited
+        - member.joined
+        - member.removed
+        - invitation.revoked
+
+    ActivityEvent:
+      type: object
+      additionalProperties: false
+      required: [id, board_id, actor_id, actor_name, action, entity_id, occurred_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        board_id:
+          $ref: '#/components/schemas/UUID'
+        actor_id:
+          $ref: '#/components/schemas/UUID'
+        actor_name:
+          type: string
+          description: Display-name snapshot of the user who performed the action.
+        action:
+          $ref: '#/components/schemas/ActivityAction'
+        entity_id:
+          $ref: '#/components/schemas/UUID'
+        task_name:
+          type: string
+          nullable: true
+          description: Snapshot of the task name for task events, including after permanent deletion.
+        details:
+          type: object
+          additionalProperties: true
+          description: Non-sensitive event details, such as changed fields or invitation email.
+        occurred_at:
+          type: string
+          format: date-time
+
+    ActivityListResponse:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ActivityEvent'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
 
     Error:
       type: object
@@ -354,12 +1232,13 @@ components:
       properties:
         code:
           type: string
-          description: Stable machine-readable error code.
-          example: todo_not_found
+          example: invalid_request
         message:
           type: string
-          description: Human-readable error message.
-          example: Todo was not found
+          description: Safe, human-readable message that does not expose private data.
+        request_id:
+          type: string
+          description: Correlation identifier for support and diagnostics.
 
     ErrorResponse:
       type: object
@@ -375,7 +1254,7 @@ components:
       properties:
         status:
           type: string
-          enum: [ok]
+          enum: [ok] [ok]
 
     ReadinessResponse:
       type: object
@@ -387,56 +1266,62 @@ components:
 
   responses:
     BadRequest:
-      description: Request validation failed or the resource ID is invalid
+      description: Request validation failed, cursor or ID is invalid, or request body is malformed.
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
-          example:
-            error:
-              code: invalid_request
-              message: The request is invalid
-
+    Unauthorized:
+      description: Authentication is missing or invalid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Forbidden:
+      description: The authenticated user is not permitted to perform this action.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    BoardNotFound:
+      description: The board does not exist or is not available to the current user.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
     TodoNotFound:
-      description: No TODO exists with the supplied ID
+      description: The task does not exist in the board's requested state or is not available to the current user.
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
-          example:
-            error:
-              code: todo_not_found
-              message: Todo was not found
-
+    InvitationNotFound:
+      description: The invitation does not exist or is not available to the current user.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: The operation conflicts with the current resource state.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
     UnsupportedMediaType:
-      description: Request Content-Type must be application/json
+      description: Request Content-Type must be application/json.
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
-          example:
-            error:
-              code: unsupported_media_type
-              message: Content-Type must be application/json
-
     InternalServerError:
-      description: Unexpected server-side error
+      description: Unexpected server-side error.
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
-          example:
-            error:
-              code: internal_error
-              message: An unexpected error occurred
-
     ServiceUnavailable:
-      description: A required dependency is unavailable or the service is not ready
+      description: A required dependency is unavailable or the service is not ready.
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
-          example:
-            error:
-              code: service_unavailable
-              message: A required dependency is unavailable

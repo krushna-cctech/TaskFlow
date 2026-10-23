@@ -25,14 +25,20 @@ board with To Do, In Progress, and Done columns.
 
 ## Product scope
 
-The initial product is a personal task-management application. Users
-should be able to create, view, update, search, and delete their tasks,
-and move tasks through a three-stage workflow. Account sharing, team
-boards, and custom workflow columns are not part of the initial scope.
+The product supports both personal and collaborative task management.
+Users can manage a private board on their own without configuring
+collaboration, and can optionally share boards with other authorized users.
+Both use the same three-stage task workflow, trash and restore behavior,
+and audit history. Custom workflow columns are not part of the current
+scope.
 
-The intended API capabilities are TODO CRUD, bounded list pagination,
-input validation, consistent errors, and health/readiness checks. These
-are design goals until implemented and tested.
+The intended capabilities include task and board management, bounded list
+pagination, input validation, consistent errors, audit history, operational
+logging, and health/readiness checks. These are design goals until
+implemented and tested. The planned identity integration uses bearer tokens
+from an external OIDC-compatible provider. Personal-board use does not
+require sharing; shared-board access is controlled by ownership and
+membership.
 
 ## Technology direction
 
@@ -51,16 +57,18 @@ tool is currently configured in this repository.
 | File | Purpose |
 | --- | --- |
 | `README.md` | Project overview, current design, and status |
-| `user_strories.md` | End-user stories and acceptance criteria, including Kanban |
-| `swagger.yaml` | Intended API specification; validate and maintain as OpenAPI YAML |
-| `db_schema.dbml` | MySQL-oriented database design |
+| `PRD.md` | Product requirements, scope, rules, and delivery priorities |
+| `user_stories.md` | Prioritized end-user stories and acceptance criteria |
+| `swagger.yaml` | Planned OpenAPI 3.0 API contract |
+| `db_schema.dbml` | Planned MySQL-oriented database design |
 | `tests/todo_api_test.go` | Black-box test scaffold for the TODO API workflow |
 
 There is currently no application source tree or executable setup
 command. The API test scaffold requires a running service and
-`TODO_API_BASE_URL`; it skips when that variable is not set. Add build,
-run, and full test instructions when the Go service and its dependencies
-are added.
+`TODO_API_BASE_URL`; it skips when that variable is not set. The scaffold
+currently exercises the earlier TODO-only contract and must be aligned with
+the board-scoped API when implementation begins. Add build, run, and full
+test instructions when the Go service and its dependencies are added.
 
 ## API design
 
@@ -69,43 +77,53 @@ these routes; they are not live endpoints yet:
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
-| `POST` | `/v1/todos` | Create a task |
-| `GET` | `/v1/todos` | List tasks with cursor pagination |
-| `GET` | `/v1/todos/{id}` | Retrieve a task |
-| `PATCH` | `/v1/todos/{id}` | Update a task name or status |
-| `DELETE` | `/v1/todos/{id}` | Delete a task |
+| `GET`, `POST` | `/v1/boards` | List accessible boards; create a private board |
+| `GET`, `PATCH` | `/v1/boards/{boardId}` | View or rename a board |
+| `GET`, `POST` | `/v1/boards/{boardId}/todos` | List/search or create active tasks |
+| `GET`, `PATCH`, `DELETE` | `/v1/boards/{boardId}/todos/{todoId}` | View, update, or move a task to trash |
+| `POST` | `/v1/boards/{boardId}/todos/bulk/trash` | Move selected tasks to trash |
+| `GET` | `/v1/boards/{boardId}/trash` | List trashed tasks |
+| `POST`, `DELETE` | `/v1/boards/{boardId}/trash/{todoId}/restore`, `/v1/boards/{boardId}/trash/{todoId}` | Restore or permanently delete a task |
+| `POST` | `/v1/boards/{boardId}/trash/bulk/delete` | Permanently delete selected trashed tasks |
+| `GET`, `POST`, `DELETE` | `/v1/boards/{boardId}/invitations` and `/v1/boards/{boardId}/members/{userId}` | Manage invitations and membership |
+| `POST` | `/v1/invitations/{invitationId}/accept` | Accept an invitation |
+| `GET` | `/v1/boards/{boardId}/activity` | Review board activity |
 | `GET` | `/health` | Check whether the API process is running |
 | `GET` | `/ready` | Check whether the API can serve requests |
 
-Authentication requirements have not been defined. The API contract and
-database design must be reconciled before implementation: they currently
-disagree on task identifiers, task-name fields, and status representation.
-See [Data model](#data-model).
+The API contract is a planned design, not a running service. Protected
+endpoints require an external-provider bearer token. Task deletion moves
+the task to trash; permanent deletion is a separate owner-only action.
+See [PRD.md](PRD.md) for product requirements and decisions.
 
 ## Data model
 
-The DBML design currently defines `users` and `todos`. A TODO has a
-numeric ID, `user_id`, `title`, optional description and due date, a
-`completed` boolean, and timestamps. The API draft instead describes a
-UUID `id`, `name`, and a three-value status (`pending`, `in_progress`,
-`completed`). These differences need an explicit design decision before
-database migrations or API implementation.
+The planned DBML contains users, boards, memberships, invitations, tasks,
+assignees, and activity events. UUIDs, task names, statuses, board scoping,
+soft deletion, and audit retention are aligned with the OpenAPI contract.
+The schema is a design artifact and still requires migrations and
+implementation.
 
 For the Kanban workflow, the intended columns correspond to `pending`
-(To Do), `in_progress` (In Progress), and `completed` (Done). The current
-DBML boolean cannot represent all three stages, so it must be updated if
-the three-column workflow is selected. Keep the DBML, OpenAPI document,
-Go model, and migrations consistent.
+(To Do), `in_progress` (In Progress), and `completed` (Done). Keep the
+DBML, OpenAPI document, Go model, and migrations consistent as they are
+updated for personal boards, optional collaboration, and trash behavior.
 
 ## Kanban workflow
 
-The planned end-user experience is described in
-[`user_strories.md`](user_strories.md). Its MVP stories cover:
+The end-user requirements are described in [PRD.md](PRD.md) and
+[`user_stories.md`](user_stories.md). They cover:
 
 -   Viewing tasks in To Do, In Progress, and Done columns.
 -   Creating a task, optionally choosing its initial status.
 -   Moving tasks between columns and retaining the change after reload.
--   Editing, viewing, searching, and deleting tasks.
+-   Validating task input and providing clear operation errors.
+-   Editing, viewing, and searching tasks.
+-   Moving one or many tasks to trash, restoring tasks, and permanently
+    deleting tasks.
+-   Managing a private board without collaboration, and optionally sharing
+    a board with multiple authorized users.
+-   Reviewing an audit history and maintaining safe operational logs.
 -   Showing clear empty, loading, and error states.
 
 The current repository has no frontend or board implementation. The API
@@ -124,10 +142,13 @@ states.
 
 ## Roadmap
 
--   [ ] Decide and reconcile task IDs, names, and status representation across the API and DBML.
--   [ ] Update the API and DBML to support the three Kanban workflow stages.
+-   [ ] Select and configure the external identity provider and invitation
+    delivery.
+-   [ ] Validate the OpenAPI and DBML designs and implement matching
+    migrations and API behavior.
 -   [ ] Implement the Go REST API and MySQL persistence.
 -   [ ] Add the Kanban board and core task-management interactions.
 -   [ ] Add migrations, local development configuration, and automated tests.
 -   [ ] Implement cursor pagination and health/readiness endpoints.
--   [ ] Add operational features only when needed and verify them with tests.
+-   [ ] Add structured operational logging and verify validation,
+    permissions, trash, audit, and collaboration with tests.

@@ -1,26 +1,83 @@
-
-Project todo_app {
+Project taskflow {
   database_type: 'MySQL'
+  Note: 'Planned schema for TaskFlow private and shared boards. UUIDs are stored as CHAR(36); timestamps are UTC.'
 }
 
 Table users {
-  id bigint [pk, increment]
+  id char(36) [pk, not null]
+  identity_subject varchar(255) [not null, unique, note: 'Stable subject from the external OIDC identity provider; no password is stored by TaskFlow.']
   name varchar(100) [not null]
   email varchar(255) [not null, unique]
-  password_hash varchar(255) [not null]
+  email_verified boolean [not null, default: false]
   created_at timestamp [not null, default: `CURRENT_TIMESTAMP`]
   updated_at timestamp [not null, default: `CURRENT_TIMESTAMP`]
+}
+
+Table boards {
+  id char(36) [pk, not null]
+  owner_id char(36) [not null]
+  name varchar(100) [not null]
+  created_at timestamp [not null, default: `CURRENT_TIMESTAMP`]
+  updated_at timestamp [not null, default: `CURRENT_TIMESTAMP`]
+}
+
+Table board_members {
+  board_id char(36) [not null]
+  user_id char(36) [not null]
+  role varchar(20) [not null, default: 'member', note: 'Allowed values: owner, member. A board has one owner membership and any number of member memberships.']
+  joined_at timestamp [not null, default: `CURRENT_TIMESTAMP`]
+}
+
+Table board_invitations {
+  id char(36) [pk, not null]
+  board_id char(36) [not null]
+  email varchar(255) [not null]
+  invited_by char(36) [not null]
+  status varchar(20) [not null, default: 'pending', note: 'Allowed values: pending, accepted, revoked, expired.']
+  created_at timestamp [not null, default: `CURRENT_TIMESTAMP`]
+  expires_at timestamp [not null]
+  responded_at timestamp
 }
 
 Table todos {
-  id bigint [pk, increment]
-  user_id bigint [not null]
-  title varchar(255) [not null]
-  description text
-  status varchar(20) [not null, default: 'todo', note: 'Allowed values: todo, in_progress, done']
-  due_date datetime
+  id char(36) [pk, not null]
+  board_id char(36) [not null]
+  created_by char(36) [not null]
+  name varchar(255) [not null, note: 'Must contain at least one non-whitespace character.']
+  description text [note: 'Optional; maximum 10,000 characters enforced by the API.']
+  status varchar(20) [not null, default: 'pending', note: 'Allowed values: pending, in_progress, completed.']
+  due_date date
+  deleted_at datetime [note: 'NULL for active tasks; non-NULL tasks are in trash.']
   created_at timestamp [not null, default: `CURRENT_TIMESTAMP`]
   updated_at timestamp [not null, default: `CURRENT_TIMESTAMP`]
 }
 
-Ref: todos.user_id > users.id
+Table todo_assignees {
+  todo_id char(36) [not null]
+  user_id char(36) [not null, note: 'Must be an active member of the task board; remove this assignment when board membership ends.']
+  assigned_at timestamp [not null, default: `CURRENT_TIMESTAMP`]
+}
+
+Table activity_events {
+  id char(36) [pk, not null]
+  board_id char(36) [not null]
+  actor_id char(36) [not null]
+  actor_name_snapshot varchar(100) [not null, note: 'Display-name snapshot of the actor so history remains understandable after membership changes.']
+  action varchar(40) [not null, note: 'Examples: board.created, board.renamed, task.created, task.updated, task.status_changed, task.trashed, task.restored, task.permanently_deleted, member.invited, member.joined, member.removed, invitation.revoked.']
+  entity_id char(36) [not null, note: 'ID of the affected task, member, or invitation; intentionally not a foreign key so history survives permanent task deletion.']
+  task_name_snapshot varchar(255) [note: 'Captured for task events so activity remains understandable after task deletion.']
+  details json [note: 'Non-sensitive action details; never store credentials, bearer tokens, or full sensitive request bodies.']
+  occurred_at timestamp [not null, default: `CURRENT_TIMESTAMP`]
+}
+
+Ref: boards.owner_id > users.id
+Ref: board_members.board_id > boards.id
+Ref: board_members.user_id > users.id
+Ref: board_invitations.board_id > boards.id
+Ref: board_invitations.invited_by > users.id
+Ref: todos.board_id > boards.id
+Ref: todos.created_by > users.id
+Ref: todo_assignees.todo_id > todos.id [delete: cascade]
+Ref: todo_assignees.user_id > users.id
+Ref: activity_events.board_id > boards.id
+Ref: activity_events.actor_id > users.id
