@@ -1271,7 +1271,7 @@ components:
       properties:
         status:
           type: string
-          enum: [ok] [ok]
+          enum: [ok]
 
     ReadinessResponse:
       type: object
