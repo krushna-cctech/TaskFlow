@@ -1,0 +1,1943 @@
+openapi: 3.0.3
+
+info:
+  title: Task Flow API
+  version: 1.0.0
+  description: |
+    REST API for **Task Flow**, a Kanban board application.
+
+    Sources:
+    - `user_stories.md` (US-01 … US-30) for behaviour and validation rules
+    - `database_schema.dbml` for data types, enums and relationships
+
+    ## Conventions
+    - All IDs are 64-bit integers (`bigint` in the database).
+    - All timestamps are ISO 8601 in UTC, e.g. `2026-10-29T10:15:00Z`. Dates are `YYYY-MM-DD`.
+    - Request and response bodies are JSON (`application/json`), except the live event stream.
+    - Field names use `snake_case`, the same as the database columns.
+
+    ## Authentication (US-01, US-02)
+    Sign-up and login set an HTTP-only session cookie (`tf_session`). Every other
+    endpoint needs that cookie. Logging out revokes the session on the server.
+
+    ## Access rules
+    - Only members of a board (including its owner) can see the board or anything on it.
+      For anyone else the API answers **404 Not Found**, so board IDs can't be probed.
+    - Some actions are **owner only**. A member who calls them gets **403 Forbidden**.
+
+    | Action | Owner | Member |
+    |---|:-:|:-:|
+    | View board and tasks | ✅ | ✅ |
+    | Create, edit, move tasks | ✅ | ✅ |
+    | Archive, trash, restore tasks | ✅ | ✅ |
+    | Permanently delete tasks / empty trash | ✅ | ❌ |
+    | Rename board, manage members | ✅ | ❌ |
+    | Delete board | ✅ | ❌ |
+
+    ## Board status (visibility)
+    `visibility` is read-only. A new board is `private`. It becomes `shared` when the
+    owner adds the first member and goes back to `private` when the last member is removed.
+
+    ## Task states
+    A task is `active` (on the board), `archived` (hidden, read-only) or `trashed`
+    (deleted, can be restored). Edits are only allowed on `active` tasks.
+
+    ## Concurrent edits (US-28)
+    Every task has a `version`. `PATCH /tasks/{taskId}` must send the version it was
+    based on. If someone else saved first, the API answers **409** with code
+    `version_conflict` and the latest task, so the client can re-apply or discard.
+    Moves and reorders don't need a version, so moves made at the same time by
+    different users are all saved.
+
+    ## Undo (US-30)
+    There is no undo endpoint. The client undoes an action by calling the opposite
+    endpoint (move back, restore, unarchive, or `PATCH` the old values). The undo is
+    saved and logged like any other change.
+
+    ## Errors
+    Every error uses the `Error` schema with a stable `code`. Validation errors list
+    each invalid field in `details`.
+
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local development
+
+tags:
+  - name: Auth
+    description: Sign up, log in, log out (US-01, US-02)
+  - name: Boards
+    description: Create, list, rename and delete boards (US-03 – US-05, US-25)
+  - name: Members
+    description: Invite and remove board members (US-06, US-07)
+  - name: Tasks
+    description: Create, view, edit, move, assign and filter tasks (US-08 – US-16, US-28)
+  - name: Archive & Trash
+    description: Archive, unarchive, trash, restore and permanently delete tasks (US-19 – US-24)
+  - name: Comments
+    description: Comments on tasks (US-17)
+  - name: Checklist
+    description: Checklist items inside a task (US-18)
+  - name: Activity
+    description: Task history, board feed and live updates (US-26, US-27, US-29)
+
+security:
+  - sessionCookie: []
+
+paths:
+  # ───────────────────────────── Auth ─────────────────────────────
+  /auth/signup:
+    post:
+      tags: [Auth]
+      operationId: signUp
+      summary: Create an account and log in
+      description: |
+        **US-01.** Creates the user and starts a session. The email is stored
+        lower-cased and trimmed and must not already be registered.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignUpRequest'
+      responses:
+        '201':
+          description: Account created; the user is logged in.
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SetSessionCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '409':
+          description: The email is already registered (`email_taken`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: email_taken
+                  message: An account with this email already exists.
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: logIn
+      summary: Log in
+      description: |
+        **US-02.** A wrong email or a wrong password both return the same
+        `invalid_credentials` error, so the response never says which one was wrong.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LogInRequest'
+      responses:
+        '200':
+          description: Logged in.
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SetSessionCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          description: Invalid email or password.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: invalid_credentials
+                  message: Invalid email or password.
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logOut
+      summary: Log out
+      description: '**US-02.** Revokes the current session and clears the cookie.'
+      responses:
+        '204':
+          description: Logged out.
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/ClearSessionCookie'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      operationId: getCurrentUser
+      summary: Get the logged-in user
+      description: '**US-02.** Used by the client to check whether the session is still valid.'
+      responses:
+        '200':
+          description: The current user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  # ───────────────────────────── Boards ─────────────────────────────
+  /boards:
+    get:
+      tags: [Boards]
+      operationId: listBoards
+      summary: List my boards
+      description: |
+        **US-04.** All boards the current user owns or is a member of, most
+        recently updated first. An empty list means the client shows the
+        "Create board" empty state.
+      responses:
+        '200':
+          description: The user's boards.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/BoardSummary'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+    post:
+      tags: [Boards]
+      operationId: createBoard
+      summary: Create a board
+      description: |
+        **US-03.** The current user becomes the owner. The board is created as
+        `private`, with the three fixed columns To Do, In Progress and Done.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BoardNameRequest'
+      responses:
+        '201':
+          description: Board created.
+          headers:
+            Location:
+              description: URL of the new board.
+              schema:
+                type: string
+                example: /api/v1/boards/42
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Board'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /boards/{boardId}:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    get:
+      tags: [Boards]
+      operationId: getBoard
+      summary: Get a board
+      description: |
+        The board with its columns, members and task counts. Load the tasks with
+        `GET /boards/{boardId}/tasks`. `task_counts.trashed` is the number shown
+        in the "Empty trash" confirmation (US-24).
+      responses:
+        '200':
+          description: The board.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Board'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Boards]
+      operationId: renameBoard
+      summary: Rename a board (owner only)
+      description: '**US-05.** Same validation as creating a board.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BoardNameRequest'
+      responses:
+        '200':
+          description: Board renamed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Board'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+    delete:
+      tags: [Boards]
+      operationId: deleteBoard
+      summary: Permanently delete a board (owner only)
+      description: |
+        **US-25.** Deletes the board with all its columns, tasks (active, archived
+        and trashed), comments, checklists, members and activity. This can't be undone.
+
+        The first confirmation happens in the UI. For the second confirmation the
+        client must send the board name the user typed in `confirm_name`. It must
+        match the current name exactly, otherwise nothing is deleted.
+      parameters:
+        - name: confirm_name
+          in: query
+          required: true
+          description: The board name exactly as the user typed it.
+          schema:
+            type: string
+            maxLength: 100
+          example: Website Redesign
+      responses:
+        '204':
+          description: Board deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: '`confirm_name` doesn''t match the board name (`confirm_name_mismatch`).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: confirm_name_mismatch
+                  message: The typed name does not match the board name.
+
+  # ───────────────────────────── Members ─────────────────────────────
+  /boards/{boardId}/members:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    get:
+      tags: [Members]
+      operationId: listMembers
+      summary: List board members
+      description: Owner first, then members by join date. Also used for the assignee picker (US-13).
+      responses:
+        '200':
+          description: Board members.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Member'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Members]
+      operationId: addMember
+      summary: Invite a member by email (owner only)
+      description: |
+        **US-06.** Adds a registered user to the board. No email is sent (out of
+        scope for v1). Adding the first member changes the board's `visibility`
+        from `private` to `shared`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddMemberRequest'
+      responses:
+        '201':
+          description: Member added.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemberChangeResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: |
+            Either the board doesn't exist (`not_found`) or no registered user has
+            this email (`user_not_found`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: user_not_found
+                  message: User not found.
+        '409':
+          description: The user is already a member (`already_member`). Nothing changes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: already_member
+                  message: This user is already a member of the board.
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /boards/{boardId}/members/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+      - $ref: '#/components/parameters/UserId'
+    delete:
+      tags: [Members]
+      operationId: removeMember
+      summary: Remove a member (owner only)
+      description: |
+        **US-07.** The removed user loses access right away. Their tasks on this
+        board become unassigned. If only the owner is left, the board's
+        `visibility` changes back to `private`. The owner can't be removed.
+      responses:
+        '200':
+          description: Member removed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemberChangeResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The user is the board owner (`cannot_remove_owner`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: cannot_remove_owner
+                  message: The board owner cannot be removed.
+
+  # ───────────────────────────── Tasks ─────────────────────────────
+  /boards/{boardId}/tasks:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    get:
+      tags: [Tasks]
+      operationId: listTasks
+      summary: List, search and filter a board's tasks
+      description: |
+        One endpoint for the board view, the archive view and the trash view.
+
+        - `state=active` (default): the board view (US-08 – US-16). Sorted by
+          column, then by position inside the column.
+        - `state=archived`: the archive view (US-20), newest archived first.
+        - `state=trashed`: the trash view (US-22), newest trashed first.
+
+        **Search and filters (US-16).** `q` matches title and description, ignoring
+        case. All filters can be combined (AND).
+      parameters:
+        - name: state
+          in: query
+          schema:
+            $ref: '#/components/schemas/TaskState'
+        - name: q
+          in: query
+          description: Text to search for in title and description (case-insensitive).
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+        - name: column_id
+          in: query
+          description: Only tasks in this column.
+          schema:
+            type: integer
+            format: int64
+        - name: assignee_id
+          in: query
+          description: Only tasks assigned to this user. Can't be used with `unassigned`.
+          schema:
+            type: integer
+            format: int64
+        - name: unassigned
+          in: query
+          description: Only tasks with no assignee.
+          schema:
+            type: boolean
+        - name: priority
+          in: query
+          description: One or more priorities, e.g. `?priority=high&priority=medium`.
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/TaskPriority'
+        - name: due_from
+          in: query
+          description: Due on or after this date.
+          schema:
+            type: string
+            format: date
+        - name: due_to
+          in: query
+          description: Due on or before this date.
+          schema:
+            type: string
+            format: date
+        - name: overdue
+          in: query
+          description: Only overdue tasks (due date in the past and not in the Done column).
+          schema:
+            type: boolean
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Matching tasks.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+    post:
+      tags: [Tasks]
+      operationId: createTask
+      summary: Create a task
+      description: |
+        **US-08.** The task is added at the bottom of the chosen column. The
+        creator and creation time are recorded. `assignee_id`, `due_date` and
+        `priority` can be set now or later.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTaskRequest'
+      responses:
+        '201':
+          description: Task created.
+          headers:
+            Location:
+              description: URL of the new task.
+              schema:
+                type: string
+                example: /api/v1/tasks/1001
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /tasks/{taskId}:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    get:
+      tags: [Tasks]
+      operationId: getTask
+      summary: Get task details
+      description: |
+        **US-09.** The task with its checklist. Load comments with
+        `GET /tasks/{taskId}/comments` and history with `GET /tasks/{taskId}/activities`.
+        Archived and trashed tasks can be viewed too (read-only).
+      responses:
+        '200':
+          description: The task.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskDetail'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Tasks]
+      operationId: updateTask
+      summary: Edit a task
+      description: |
+        **US-10, US-13, US-14, US-15, US-28.** Send only the fields that change.
+        A field left out stays the same. `null` clears `description`,
+        `assignee_id`, `due_date` or `priority`.
+
+        `version` is required. If it doesn't match the stored version, nothing
+        is saved and the API returns **409** `version_conflict` with the latest task.
+
+        Only `active` tasks can be edited. Archived and trashed tasks return
+        **409** `task_not_active`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTaskRequest'
+      responses:
+        '200':
+          description: Task updated. `version` has gone up by one.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/TaskConflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+    delete:
+      tags: [Archive & Trash]
+      operationId: deleteTaskPermanently
+      summary: Permanently delete a task (owner only)
+      description: |
+        **US-23.** Only possible for a task that is in the trash. The task, its
+        comments and its checklist are removed. The activity log keeps a
+        `task_deleted_permanently` entry without the task's content. This can't be undone.
+      responses:
+        '204':
+          description: Task deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The task is not in the trash (`task_not_trashed`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: task_not_trashed
+                  message: Only tasks in the trash can be permanently deleted.
+
+  /tasks/{taskId}/move:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [Tasks]
+      operationId: moveTask
+      summary: Move or reorder a task
+      description: |
+        **US-11, US-12.** One endpoint for drag and drop and the "Move to…" menu.
+
+        - Moving to another column: set `column_id` to the target column.
+        - Reordering in the same column: set `column_id` to the current column.
+        - `before_task_id` is the task the moved task should sit directly above.
+          `null` (or left out) puts it at the bottom of the column.
+
+        The server works out the stored `position` itself, so clients never send
+        position numbers. No `version` is needed, so moves made by different users
+        at the same time are all saved (US-28).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MoveTaskRequest'
+      responses:
+        '200':
+          description: Task moved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The task is not active (`task_not_active`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: |
+            `column_id` isn't a column of this board, or `before_task_id` isn't an
+            active task in that column (`validation_failed`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ───────────────────────────── Archive & Trash ─────────────────────────────
+  /tasks/{taskId}/archive:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [Archive & Trash]
+      operationId: archiveTask
+      summary: Archive a task
+      description: '**US-19.** Only `active` tasks can be archived. The task keeps all its data.'
+      responses:
+        '200':
+          $ref: '#/components/responses/TaskStateChanged'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/InvalidStateTransition'
+
+  /tasks/{taskId}/unarchive:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [Archive & Trash]
+      operationId: unarchiveTask
+      summary: Unarchive a task
+      description: '**US-20.** Only `archived` tasks. The task goes back to its original column, at the bottom.'
+      responses:
+        '200':
+          $ref: '#/components/responses/TaskStateChanged'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/InvalidStateTransition'
+
+  /tasks/{taskId}/trash:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [Archive & Trash]
+      operationId: trashTask
+      summary: Move a task to the trash
+      description: |
+        **US-21.** Works for `active` and `archived` tasks. This is not a permanent
+        delete. The **Undo** button in the toast calls `POST /tasks/{taskId}/restore`.
+      responses:
+        '200':
+          $ref: '#/components/responses/TaskStateChanged'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/InvalidStateTransition'
+
+  /tasks/{taskId}/restore:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [Archive & Trash]
+      operationId: restoreTask
+      summary: Restore a task from the trash
+      description: |
+        **US-22.** Only `trashed` tasks. The task goes back to where it was: to its
+        original column (at the bottom) if it was active, or to the archive if it
+        was archived.
+      responses:
+        '200':
+          $ref: '#/components/responses/TaskStateChanged'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/InvalidStateTransition'
+
+  /boards/{boardId}/trash:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    delete:
+      tags: [Archive & Trash]
+      operationId: emptyTrash
+      summary: Empty the board's trash (owner only)
+      description: |
+        **US-24.** Permanently deletes every trashed task on the board. The
+        confirmation dialog can show the count from `Board.task_counts.trashed`.
+      responses:
+        '200':
+          description: Trash emptied.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted_count]
+                properties:
+                  deleted_count:
+                    type: integer
+                    minimum: 0
+                    example: 7
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ───────────────────────────── Comments ─────────────────────────────
+  /tasks/{taskId}/comments:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    get:
+      tags: [Comments]
+      operationId: listComments
+      summary: List comments on a task
+      description: '**US-17.** Oldest first.'
+      responses:
+        '200':
+          description: Comments.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Comment'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Comments]
+      operationId: createComment
+      summary: Add a comment
+      description: '**US-17.** Only on `active` tasks.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentRequest'
+      responses:
+        '201':
+          description: Comment added.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Comment'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/TaskNotActive'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /comments/{commentId}:
+    parameters:
+      - $ref: '#/components/parameters/CommentId'
+    patch:
+      tags: [Comments]
+      operationId: updateComment
+      summary: Edit my comment
+      description: '**US-17.** Only the author can edit a comment.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentRequest'
+      responses:
+        '200':
+          description: Comment updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Comment'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/TaskNotActive'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+    delete:
+      tags: [Comments]
+      operationId: deleteComment
+      summary: Delete my comment
+      description: '**US-17.** Only the author can delete a comment.'
+      responses:
+        '204':
+          description: Comment deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/TaskNotActive'
+
+  # ───────────────────────────── Checklist ─────────────────────────────
+  /tasks/{taskId}/checklist-items:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [Checklist]
+      operationId: createChecklistItem
+      summary: Add a checklist item
+      description: '**US-18.** Added at the end of the list. Only on `active` tasks. The list itself comes with `GET /tasks/{taskId}`.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateChecklistItemRequest'
+      responses:
+        '201':
+          description: Item added.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChecklistItem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/TaskNotActive'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /checklist-items/{itemId}:
+    parameters:
+      - $ref: '#/components/parameters/ChecklistItemId'
+    patch:
+      tags: [Checklist]
+      operationId: updateChecklistItem
+      summary: Edit, tick, untick or reorder a checklist item
+      description: '**US-18.** Send only the fields that change.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateChecklistItemRequest'
+      responses:
+        '200':
+          description: Item updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChecklistItem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/TaskNotActive'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+    delete:
+      tags: [Checklist]
+      operationId: deleteChecklistItem
+      summary: Remove a checklist item
+      description: '**US-18.**'
+      responses:
+        '204':
+          description: Item removed.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/TaskNotActive'
+
+  # ───────────────────────────── Activity ─────────────────────────────
+  /tasks/{taskId}/activities:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    get:
+      tags: [Activity]
+      operationId: listTaskActivities
+      summary: Task history
+      description: |
+        **US-26.** Newest first. Entries are read-only; there is no endpoint to edit
+        or delete them.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Activity entries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivityPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /boards/{boardId}/activities:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    get:
+      tags: [Activity]
+      operationId: listBoardActivities
+      summary: Board activity feed
+      description: |
+        **US-27.** Activity across all tasks and membership changes, newest first,
+        with "load more" through `next_cursor`. An entry links to its task only if
+        `task_id` is not `null` (permanently deleted tasks have `null`).
+      parameters:
+        - name: actor_id
+          in: query
+          description: Only activity by this member.
+          schema:
+            type: integer
+            format: int64
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Activity entries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivityPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /boards/{boardId}/events:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    get:
+      tags: [Activity]
+      operationId: streamBoardEvents
+      summary: Live updates (Server-Sent Events)
+      description: |
+        **US-29.** A long-lived `text/event-stream` connection. Each saved change
+        on the board is pushed as an event a moment after it is committed.
+
+        ```
+        id: 5012
+        event: activity
+        data: {"activity": { ...Activity... }, "task": { ...Task or null... }}
+
+        event: board_deleted
+        data: {"board_id": 42}
+        ```
+
+        - `id` is the activity id. After a dropped connection the browser sends
+          `Last-Event-ID`, and the server replays the events it missed.
+        - `task` is the task as it is now (`null` for membership events and
+          permanent deletes), so the client can update the card without another request.
+        - If the user is removed from the board, the server sends `access_revoked`
+          and closes the stream.
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          required: false
+          description: Id of the last event received; the server resends anything newer.
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Event stream (stays open).
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              x-event-payload:
+                $ref: '#/components/schemas/BoardEvent'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: tf_session
+      description: |
+        Opaque session token, set by sign-up and login. The cookie is `HttpOnly`,
+        `Secure` and `SameSite=Lax`. Only its SHA-256 hash is stored in the database.
+
+  headers:
+    SetSessionCookie:
+      description: Session cookie for the new session.
+      schema:
+        type: string
+        example: tf_session=abc123; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=1209600
+    ClearSessionCookie:
+      description: Clears the session cookie.
+      schema:
+        type: string
+        example: tf_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0
+
+  parameters:
+    BoardId:
+      name: boardId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      example: 42
+    TaskId:
+      name: taskId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      example: 1001
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      example: 7
+    CommentId:
+      name: commentId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    ChecklistItemId:
+      name: itemId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    Limit:
+      name: limit
+      in: query
+      description: Maximum number of items to return.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      description: The `next_cursor` from the previous page. Leave out for the first page.
+      schema:
+        type: string
+
+  responses:
+    Unauthenticated:
+      description: No valid session (`unauthenticated`). The client sends the user to the login page.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: unauthenticated
+              message: Please log in.
+    Forbidden:
+      description: The user is a member but this action needs the owner, or the comment's author (`forbidden`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: forbidden
+              message: Only the board owner can do this.
+    NotFound:
+      description: The resource doesn't exist, or the user isn't a member of its board (`not_found`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: not_found
+              message: Board not found.
+    ValidationFailed:
+      description: One or more fields are invalid (`validation_failed`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: validation_failed
+              message: Some fields are invalid.
+              details:
+                - field: title
+                  message: Title is required.
+    TooManyRequests:
+      description: Too many attempts; try again later (`rate_limited`).
+      headers:
+        Retry-After:
+          description: Seconds to wait before trying again.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TaskConflict:
+      description: |
+        Either the task was changed by someone else (`version_conflict`, with the
+        latest task in `current`), or the task is archived or trashed and can't be
+        edited (`task_not_active`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/TaskConflictError'
+          example:
+            error:
+              code: version_conflict
+              message: This task was changed by someone else.
+            current:
+              id: 1001
+              version: 4
+    TaskNotActive:
+      description: The task is archived or trashed and is read-only (`task_not_active`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: task_not_active
+              message: Archived and trashed tasks are read-only.
+    InvalidStateTransition:
+      description: The task isn't in a state that allows this action (`invalid_state_transition`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: invalid_state_transition
+              message: Only active tasks can be archived.
+    TaskStateChanged:
+      description: The task in its new state.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Task'
+
+  schemas:
+    # ───────── Enums (match database_schema.dbml) ─────────
+    BoardRole:
+      type: string
+      enum: [owner, member]
+    BoardVisibility:
+      type: string
+      enum: [private, shared]
+      description: Set automatically from the member list; never sent by the client.
+    ColumnKind:
+      type: string
+      enum: [todo, in_progress, done]
+    TaskState:
+      type: string
+      enum: [active, archived, trashed]
+      default: active
+    TaskPriority:
+      type: string
+      enum: [low, medium, high]
+    ActivityAction:
+      type: string
+      enum:
+        - board_created
+        - board_renamed
+        - member_added
+        - member_removed
+        - task_created
+        - task_edited
+        - task_moved
+        - task_assigned
+        - task_unassigned
+        - task_due_date_changed
+        - task_priority_changed
+        - task_archived
+        - task_unarchived
+        - task_trashed
+        - task_restored
+        - task_deleted_permanently
+        - trash_emptied
+
+    # ───────── Users & auth ─────────
+    User:
+      type: object
+      required: [id, name, email, avatar_url, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 7
+        name:
+          type: string
+          example: Asha Rao
+        email:
+          type: string
+          format: email
+          example: asha@example.com
+        avatar_url:
+          type: string
+          format: uri
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    UserSummary:
+      type: object
+      description: A user as shown on cards, member lists and activity entries.
+      required: [id, name, avatar_url]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 7
+        name:
+          type: string
+          example: Asha Rao
+        avatar_url:
+          type: string
+          format: uri
+          nullable: true
+    SignUpRequest:
+      type: object
+      required: [name, email, password]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: Asha Rao
+        email:
+          type: string
+          format: email
+          maxLength: 255
+          example: asha@example.com
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 72
+          description: At least 8 characters. Max 72 bytes (the bcrypt input limit). Never stored; only its hash is.
+    LogInRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          example: asha@example.com
+        password:
+          type: string
+          format: password
+
+    # ───────── Boards & members ─────────
+    BoardNameRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Trimmed by the server; must not be blank.
+          example: Website Redesign
+    BoardSummary:
+      type: object
+      description: One row in "My boards" (US-04).
+      required: [id, name, visibility, my_role, owner, member_count, updated_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 42
+        name:
+          type: string
+          example: Website Redesign
+        visibility:
+          $ref: '#/components/schemas/BoardVisibility'
+        my_role:
+          $ref: '#/components/schemas/BoardRole'
+        owner:
+          $ref: '#/components/schemas/UserSummary'
+        member_count:
+          type: integer
+          description: Number of people on the board, including the owner.
+          example: 3
+        updated_at:
+          type: string
+          format: date-time
+    Board:
+      type: object
+      required: [id, name, visibility, my_role, owner, columns, members, task_counts, created_at, updated_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 42
+        name:
+          type: string
+          example: Website Redesign
+        visibility:
+          $ref: '#/components/schemas/BoardVisibility'
+        my_role:
+          $ref: '#/components/schemas/BoardRole'
+        owner:
+          $ref: '#/components/schemas/UserSummary'
+        columns:
+          type: array
+          description: Always the three fixed columns, ordered left to right.
+          minItems: 3
+          maxItems: 3
+          items:
+            $ref: '#/components/schemas/Column'
+        members:
+          type: array
+          description: Owner first.
+          items:
+            $ref: '#/components/schemas/Member'
+        task_counts:
+          type: object
+          required: [active, archived, trashed]
+          properties:
+            active:
+              type: integer
+              example: 18
+            archived:
+              type: integer
+              example: 5
+            trashed:
+              type: integer
+              example: 2
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Column:
+      type: object
+      required: [id, kind, name, position]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 120
+        kind:
+          $ref: '#/components/schemas/ColumnKind'
+        name:
+          type: string
+          example: To Do
+        position:
+          type: integer
+          description: Left-to-right order on the board (0, 1, 2). Not related to `Task.position`.
+          example: 0
+    Member:
+      type: object
+      required: [user, role, joined_at]
+      properties:
+        user:
+          $ref: '#/components/schemas/UserSummary'
+        role:
+          $ref: '#/components/schemas/BoardRole'
+        joined_at:
+          type: string
+          format: date-time
+    AddMemberRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+          example: ravi@example.com
+    MemberChangeResponse:
+      type: object
+      description: Returned after adding or removing a member, so the client can update the board status.
+      required: [board_visibility]
+      properties:
+        member:
+          $ref: '#/components/schemas/Member'
+        board_visibility:
+          $ref: '#/components/schemas/BoardVisibility'
+
+    # ───────── Tasks ─────────
+    Task:
+      type: object
+      required:
+        - id
+        - board_id
+        - column_id
+        - title
+        - description
+        - position
+        - assignee
+        - due_date
+        - priority
+        - is_overdue
+        - state
+        - archived_at
+        - archived_by
+        - trashed_at
+        - trashed_by
+        - checklist_progress
+        - comment_count
+        - version
+        - created_by
+        - created_at
+        - updated_by
+        - updated_at
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 1001
+        board_id:
+          type: integer
+          format: int64
+          example: 42
+        column_id:
+          type: integer
+          format: int64
+          description: The task's column. Kept while archived or trashed, so the task can go back to it.
+          example: 120
+        title:
+          type: string
+          example: Fix login bug
+        description:
+          type: string
+          nullable: true
+        position:
+          type: integer
+          format: int64
+          description: Top-to-bottom order inside the column. Set by the server; clients only sort by it.
+          example: 3072
+        assignee:
+          allOf:
+            - $ref: '#/components/schemas/UserSummary'
+          nullable: true
+        due_date:
+          type: string
+          format: date
+          nullable: true
+          example: '2026-11-15'
+        priority:
+          allOf:
+            - $ref: '#/components/schemas/TaskPriority'
+          nullable: true
+        is_overdue:
+          type: boolean
+          description: True when the due date is in the past and the task is not in the Done column (US-14).
+        state:
+          $ref: '#/components/schemas/TaskState'
+        archived_at:
+          type: string
+          format: date-time
+          nullable: true
+        archived_by:
+          allOf:
+            - $ref: '#/components/schemas/UserSummary'
+          nullable: true
+        trashed_at:
+          type: string
+          format: date-time
+          nullable: true
+        trashed_by:
+          allOf:
+            - $ref: '#/components/schemas/UserSummary'
+          nullable: true
+        checklist_progress:
+          type: object
+          description: Shown on the card as `done / total` (US-18).
+          required: [done, total]
+          properties:
+            done:
+              type: integer
+              example: 2
+            total:
+              type: integer
+              example: 5
+        comment_count:
+          type: integer
+          example: 3
+        version:
+          type: integer
+          description: Send this back in `PATCH /tasks/{taskId}` (US-28).
+          example: 3
+        created_by:
+          $ref: '#/components/schemas/UserSummary'
+        created_at:
+          type: string
+          format: date-time
+        updated_by:
+          allOf:
+            - $ref: '#/components/schemas/UserSummary'
+          nullable: true
+        updated_at:
+          type: string
+          format: date-time
+    TaskDetail:
+      description: A task with its checklist (US-09).
+      allOf:
+        - $ref: '#/components/schemas/Task'
+        - type: object
+          required: [checklist_items]
+          properties:
+            checklist_items:
+              type: array
+              description: Ordered by position.
+              items:
+                $ref: '#/components/schemas/ChecklistItem'
+    TaskPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Task'
+        next_cursor:
+          type: string
+          nullable: true
+          description: Pass as `cursor` to get the next page; `null` on the last page.
+    CreateTaskRequest:
+      type: object
+      required: [column_id, title]
+      properties:
+        column_id:
+          type: integer
+          format: int64
+          description: Must be a column of this board.
+          example: 120
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Trimmed by the server; must not be blank.
+          example: Fix login bug
+        description:
+          type: string
+          maxLength: 5000
+          nullable: true
+        assignee_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: Must be a member of the board (US-13).
+        due_date:
+          type: string
+          format: date
+          nullable: true
+        priority:
+          allOf:
+            - $ref: '#/components/schemas/TaskPriority'
+          nullable: true
+    UpdateTaskRequest:
+      type: object
+      description: Only send the fields that change. `null` clears a field.
+      required: [version]
+      minProperties: 2
+      properties:
+        version:
+          type: integer
+          description: The version the edit is based on (US-28).
+          example: 3
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 5000
+          nullable: true
+        assignee_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: A board member's id, or `null` to unassign (US-13).
+        due_date:
+          type: string
+          format: date
+          nullable: true
+          description: '`null` removes the due date (US-14).'
+        priority:
+          allOf:
+            - $ref: '#/components/schemas/TaskPriority'
+          nullable: true
+          description: '`null` removes the priority (US-15).'
+    MoveTaskRequest:
+      type: object
+      required: [column_id]
+      properties:
+        column_id:
+          type: integer
+          format: int64
+          description: Target column (the current column to reorder).
+          example: 121
+        before_task_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: The task to place this one directly above. `null` = bottom of the column.
+          example: 1005
+
+    # ───────── Comments & checklist ─────────
+    Comment:
+      type: object
+      required: [id, task_id, author, body, created_at, updated_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        task_id:
+          type: integer
+          format: int64
+        author:
+          $ref: '#/components/schemas/UserSummary'
+        body:
+          type: string
+          example: I can reproduce this on Safari.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Set when the comment was edited; `null` = never edited.
+    CommentRequest:
+      type: object
+      required: [body]
+      properties:
+        body:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: Trimmed by the server; must not be blank.
+    ChecklistItem:
+      type: object
+      required: [id, task_id, content, is_done, position, created_at, updated_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        task_id:
+          type: integer
+          format: int64
+        content:
+          type: string
+          example: Write unit tests
+        is_done:
+          type: boolean
+        position:
+          type: integer
+          description: Order inside the task's checklist.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    CreateChecklistItemRequest:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: string
+          minLength: 1
+          maxLength: 500
+    UpdateChecklistItemRequest:
+      type: object
+      description: Only send the fields that change.
+      minProperties: 1
+      properties:
+        content:
+          type: string
+          minLength: 1
+          maxLength: 500
+        is_done:
+          type: boolean
+        position:
+          type: integer
+          minimum: 0
+          description: New place in the list (0 = first). Other items shift to make room.
+
+    # ───────── Activity ─────────
+    Activity:
+      type: object
+      required: [id, board_id, task_id, actor, action, details, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 5012
+        board_id:
+          type: integer
+          format: int64
+          example: 42
+        task_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: '`null` for board and membership events, and for tasks that were permanently deleted.'
+          example: 1001
+        actor:
+          $ref: '#/components/schemas/UserSummary'
+        action:
+          $ref: '#/components/schemas/ActivityAction'
+        details:
+          type: object
+          additionalProperties: true
+          description: |
+            What changed. The shape depends on `action`. It never contains task
+            titles, descriptions or comment text.
+
+            | action | details |
+            |---|---|
+            | `member_added`, `member_removed` | `{"user_id": 9}` |
+            | `task_edited` | `{"fields": ["title", "description"]}` |
+            | `task_moved` | `{"from_column_id": 120, "to_column_id": 121}` |
+            | `task_assigned` | `{"from_user_id": null, "to_user_id": 9}` |
+            | `task_unassigned` | `{"from_user_id": 9}` |
+            | `task_due_date_changed` | `{"from": null, "to": "2026-11-15"}` |
+            | `task_priority_changed` | `{"from": "low", "to": "high"}` |
+            | `task_restored` | `{"restored_to": "active"}` |
+            | `trash_emptied` | `{"count": 7}` |
+          example:
+            from_column_id: 120
+            to_column_id: 121
+        created_at:
+          type: string
+          format: date-time
+    ActivityPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Activity'
+        next_cursor:
+          type: string
+          nullable: true
+          description: Pass as `cursor` to load more; `null` when there is nothing older.
+    BoardEvent:
+      type: object
+      description: The JSON in the `data:` line of an `activity` event on the live stream (US-29).
+      required: [activity, task]
+      properties:
+        activity:
+          $ref: '#/components/schemas/Activity'
+        task:
+          allOf:
+            - $ref: '#/components/schemas/Task'
+          nullable: true
+
+    # ───────── Errors ─────────
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable, machine-readable error code.
+              enum:
+                - unauthenticated
+                - invalid_credentials
+                - rate_limited
+                - forbidden
+                - not_found
+                - user_not_found
+                - validation_failed
+                - email_taken
+                - already_member
+                - cannot_remove_owner
+                - confirm_name_mismatch
+                - version_conflict
+                - task_not_active
+                - task_not_trashed
+                - invalid_state_transition
+            message:
+              type: string
+              description: Human-readable message that can be shown to the user.
+            details:
+              type: array
+              description: Per-field problems, for `validation_failed`.
+              items:
+                type: object
+                required: [field, message]
+                properties:
+                  field:
+                    type: string
+                    example: title
+                  message:
+                    type: string
+                    example: Title is required.
+    TaskConflictError:
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - type: object
+          properties:
+            current:
+              $ref: '#/components/schemas/Task'
